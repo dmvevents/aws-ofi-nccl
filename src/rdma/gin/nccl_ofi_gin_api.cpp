@@ -229,7 +229,7 @@ static ncclResult_t nccl_ofi_gin_connect(void *ctx, void *handles[], int nranks,
 	return nccl_net_ofi_retval_translate(ret);
 }
 
-static ncclResult_t nccl_ofi_gin_regMrSymDmaBuf(void *collComm, void *data, size_t size, int type,
+ncclResult_t nccl_ofi_gin_regMrSymDmaBuf(void *collComm, void *data, size_t size, int type,
 						uint64_t offset, int fd, uint64_t mrFlags,
 						void **mhandle, void **ginHandle)
 {
@@ -258,14 +258,14 @@ static ncclResult_t nccl_ofi_gin_regMrSymDmaBuf(void *collComm, void *data, size
 	return ncclSuccess;
 }
 
-static ncclResult_t nccl_ofi_gin_regMrSym(void *collComm, void *data, size_t size, int type,
+ncclResult_t nccl_ofi_gin_regMrSym(void *collComm, void *data, size_t size, int type,
 					  uint64_t mrFlags, void **mhandle, void **ginHandle)
 {
 	return nccl_ofi_gin_regMrSymDmaBuf(collComm, data, size, type, 0, -1, mrFlags, mhandle,
 					   ginHandle);
 }
 
-static ncclResult_t nccl_ofi_gin_deregMrSym(void *collComm, void *mhandle)
+ncclResult_t nccl_ofi_gin_deregMrSym(void *collComm, void *mhandle)
 {
 	auto *comm = static_cast<nccl_ofi_rdma_gin_put_comm *>(collComm);
 	auto *mr_handle = static_cast<nccl_ofi_gin_symm_mr_handle_t *>(mhandle);

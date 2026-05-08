@@ -144,8 +144,16 @@ struct nccl_ofi_gin_gdaki_dev_handle {
 	 *       gdqp above. */
 	struct efa_cuda_cq *cq;                                        /* [112]*/
 
-	/* [120] Reserved for future use. Total size: 128 bytes. */
-	void *_reserved0;                                              /* [120]*/
+	/* [120] Per-peer spinlock array. `uint32_t peer_locks[nranks]`
+	 *       in GPU memory, zero-init. Used by our override to serialize
+	 *       concurrent same-peer RDMA_WRITEs when DeepEP's barrier fires
+	 *       signals from N parallel threads within one SM. Without this
+	 *       lock, EFA SRD multipath can deliver two WRs targeting the
+	 *       same 8-byte slot out-of-order and the older stamp overwrites
+	 *       the newer — monotonicity violation. This closes the T11
+	 *       1-stamp-behind race observed at ~25k pressure iterations.
+	 *       Total struct size: 128 bytes. */
+	uint32_t *peer_locks;                                          /* [120]*/
 };
 
 #ifdef __cplusplus

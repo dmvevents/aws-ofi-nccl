@@ -70,6 +70,7 @@ struct nccl_ofi_gin_gdaki_context {
 	uint16_t *d_address_handles;  /* uint16_t[nranks]*/
 	uint16_t *d_remote_qpns;      /* uint16_t[nranks]*/
 	uint32_t *d_qkeys;            /* uint32_t[nranks]*/
+	uint32_t *d_peer_locks;       /* uint32_t[nranks] spinlocks */
 
 	/* ---- efa-dp-direct QP / CQ device objects ---- */
 

@@ -209,6 +209,7 @@ static void gdaki_destroy_ctx(struct nccl_ofi_gin_gdaki_context *ctx)
 	cuda_free(ctx->d_address_handles);
 	cuda_free(ctx->d_remote_qpns);
 	cuda_free(ctx->d_qkeys);
+	cuda_free(ctx->d_peer_locks);
 
 	if (ctx->signals_mr) {
 		fi_close(&ctx->signals_mr->fid);
@@ -466,6 +467,17 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm,
 			throw std::runtime_error("cudaMemcpy qkeys failed");
 		}
 
+		/* Per-peer spinlock array (zero-init). Used by override's Put
+		 * signal-only branch to serialize same-peer WRs across concurrent
+		 * threads within one SM. Closes the EFA SRD reorder race where
+		 * two WRs to the same 8-byte slot could be delivered out of
+		 * order and the older stamp overwrites the newer. */
+		ctx->d_peer_locks = static_cast<uint32_t *>(
+			cuda_alloc_zeroed((size_t)nranks * sizeof(uint32_t)));
+		if (!ctx->d_peer_locks) {
+			throw std::runtime_error("cudaMalloc for peer_locks failed");
+		}
+
 		/* ---- 6. Allocate + register signals_buffer (fixes the struct-alias
 		 *        bug that caused 2026-05-08 cross-node CUDA illegal addr) ---- */
 
@@ -554,7 +566,7 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm,
 		h.nranks = nranks;                                 /* [104] */
 		h.rank = rank;                                     /* [108] */
 		h.cq = ctx->d_cq;                                  /* [112] */
-		h._reserved0 = nullptr;                            /* [120] */
+		h.peer_locks = ctx->d_peer_locks;                  /* [120] */
 
 		ctx->d_handle = static_cast<nccl_ofi_gin_gdaki_dev_handle *>(
 			cuda_alloc_zeroed(sizeof(h)));

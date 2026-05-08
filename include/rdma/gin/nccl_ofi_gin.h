@@ -179,10 +179,23 @@ public:
 		return rank;
 	}
 
+	int get_nranks() const
+	{
+		return nranks;
+	}
+
 	int get_dev() const
 	{
 		return dev;
 	}
+
+	nccl_ofi_gin_allgather_comm &get_ag_comm()
+	{
+		return ag_comm;
+	}
+
+	void set_gdaki_ctx(void *ctx) { gdaki_ctx = ctx; }
+	void *get_gdaki_ctx() const { return gdaki_ctx; }
 
 	/**
 	 * Symmetric memory registration API. All ranks in the communicator must call this
@@ -338,6 +351,9 @@ private:
 	/* Number of outstanding RDMA writes for signal delivery acknowledgement
 	   Used to wait for remaining acknowledgements on communicator close. */
 	size_t outstanding_ack_counter = 0;
+
+	/* GDAKI host-side context, set by createContext. nullptr in proxy mode. */
+	void *gdaki_ctx = nullptr;
 
 	/* Active queue of peers with pending acks.
 	   Only these are visited by flush_stale_acks(). */

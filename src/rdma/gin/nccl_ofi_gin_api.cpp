@@ -78,9 +78,14 @@ static ncclResult_t nccl_ofi_gin_init(void **ctx, uint64_t commId, ncclDebugLogg
 	/*
 	 * Morph the exported plugin to GDAKI if requested.
 	 *
-	 * Copy shared functions (init, devices, listen, connect) from the
-	 * proxy plugin into the GDAKI plugin, then overwrite the exported
-	 * symbol with the GDAKI plugin.
+	 * Copy the proxy-side APIs that GDAKI reuses as-is into the GDAKI
+	 * plugin table, then overwrite the exported symbol.
+	 *
+	 * GDAKI overrides only the APIs that have GPU-side semantics:
+	 * createContext, destroyContext, getProperties, queryLastError. Memory
+	 * registration (regMrSym / regMrSymDmaBuf / deregMrSym) falls back to
+	 * the proxy-side path in v1; a GDAKI-native dmabuf implementation
+	 * lands in T6.
 	 */
 	if (nccl_ofi_gin_gdaki_enabled()) {
 		NCCL_OFI_INFO(NCCL_NET | NCCL_INIT, "gin: GDAKI mode enabled (OFI_NCCL_GIN_GDAKI=1)");
@@ -88,6 +93,13 @@ static ncclResult_t nccl_ofi_gin_init(void **ctx, uint64_t commId, ncclDebugLogg
 		nccl_ofi_gin_gdaki_plugin.devices = ncclGinPlugin_v13.devices;
 		nccl_ofi_gin_gdaki_plugin.listen = ncclGinPlugin_v13.listen;
 		nccl_ofi_gin_gdaki_plugin.connect = ncclGinPlugin_v13.connect;
+		nccl_ofi_gin_gdaki_plugin.regMrSym = ncclGinPlugin_v13.regMrSym;
+		nccl_ofi_gin_gdaki_plugin.regMrSymDmaBuf = ncclGinPlugin_v13.regMrSymDmaBuf;
+		nccl_ofi_gin_gdaki_plugin.deregMrSym = ncclGinPlugin_v13.deregMrSym;
+		nccl_ofi_gin_gdaki_plugin.closeColl = ncclGinPlugin_v13.closeColl;
+		nccl_ofi_gin_gdaki_plugin.closeListen = ncclGinPlugin_v13.closeListen;
+		nccl_ofi_gin_gdaki_plugin.ginProgress = ncclGinPlugin_v13.ginProgress;
+		nccl_ofi_gin_gdaki_plugin.finalize = ncclGinPlugin_v13.finalize;
 		memcpy(&ncclGinPlugin_v13, &nccl_ofi_gin_gdaki_plugin, sizeof(ncclGinPlugin_v13));
 	}
 

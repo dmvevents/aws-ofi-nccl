@@ -690,6 +690,10 @@ static ncclResult_t gdaki_reg_mr_common(void *collComm, void *data, size_t size,
 	int rank = ctx->rank;
 	auto *gda_ops = static_cast<struct fi_efa_ops_gda *>(ctx->gda_ops);
 
+	NCCL_OFI_INFO(NCCL_NET,
+		"gin GDAKI regMr: type=%d (HOST=%d,CUDA=%d) size=%zu data=%p dmabuf_fd=%d",
+		type, NCCL_PTR_HOST, NCCL_PTR_CUDA, size, data, dmabuf_fd);
+
 	try {
 		/* Step 2: register on our efa-direct domain. For CUDA memory,
 		 * prefer dmabuf to avoid GDRCopy path; fall back to FI_HMEM. */
@@ -726,6 +730,8 @@ static ncclResult_t gdaki_reg_mr_common(void *collComm, void *data, size_t size,
 
 		int ret = fi_mr_regattr(ctx->ofi_domain, &attr, flags, &mr);
 		if (ret != 0) {
+			NCCL_OFI_WARN("gin GDAKI regMr: fi_mr_regattr FAILED type=%d size=%zu err=%s",
+				type, size, fi_strerror(-ret));
 			throw std::runtime_error(std::string("fi_mr_regattr GDAKI window: ") +
 						 fi_strerror(-ret));
 		}
@@ -733,6 +739,9 @@ static ncclResult_t gdaki_reg_mr_common(void *collComm, void *data, size_t size,
 		uint32_t lkey_val = (uint32_t)gda_ops->get_mr_lkey(mr);
 		uint64_t rkey_val = fi_mr_key(mr);
 		uint64_t va_val = (uint64_t)data;
+		NCCL_OFI_INFO(NCCL_NET,
+			"gin GDAKI regMr: OK type=%d size=%zu va=0x%lx rkey=0x%lx lkey=0x%x flags=0x%lx iface=%d",
+			type, size, va_val, rkey_val, lkey_val, flags, (int)attr.iface);
 
 		/* Step 3: allgather per-peer rkeys AND per-peer base VAs. */
 		std::vector<uint64_t> all_rkeys(nranks, 0);

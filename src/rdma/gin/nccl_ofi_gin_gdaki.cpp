@@ -622,6 +622,246 @@ static ncclResult_t nccl_ofi_gin_gdaki_destroyContext(void *ginCtx)
 #endif
 }
 
+/*
+ * GDAKI-native regMrSym. DeepEP dispatch calls this per window
+ * (per token buffer, per scale MR). We need to:
+ *   1. Let the proxy-side regMrSym do its job (symmetric bootstrap).
+ *   2. Additionally register the buffer on OUR efa-direct domain so the
+ *      GPU kernel can post RDMA_WRITEs targeting it.
+ *   3. Allgather per-peer rkeys AND per-peer base VAs across ranks.
+ *   4. Build an mr_handle whose layout matches what the override expects:
+ *        { __be32* rkeys_ptr; __be32 lkey; int32_t nranks;
+ *          __be32 rkeys[nranks]; uint64_t peer_bases[nranks]; }
+ *   5. Wrap it in nccl_ofi_gin_gdaki_mr_reg { fid_mr*, mr_handle* }
+ *      and publish through *ginHandle.
+ *
+ * Before T6 (2026-05-08 evening) we inherited the proxy regMrSym which
+ * returned a proxy-domain handle through ginHandle — our override read
+ * that and got garbage rkeys/VAs, failing dispatch with
+ * "CPU side received count: 0 0 0 0". The override's peer_mr_base()
+ * helper expects peer_bases to follow rkeys in-allocation; previous
+ * reference impls (anshumang fork) wrote only rkeys, missing peer_bases.
+ * This implementation writes both.
+ */
+#if HAVE_EFA_DP_DIRECT && HAVE_DECL_FI_EFA_GDA_OPS
+
+static ncclResult_t gdaki_reg_mr_common(void *collComm, void *data, size_t size,
+					int type, uint64_t mrFlags,
+					int dmabuf_fd, size_t dmabuf_offset,
+					void **mhandle, void **ginHandle)
+{
+	if (collComm == nullptr || data == nullptr || mhandle == nullptr ||
+	    ginHandle == nullptr) {
+		return ncclInvalidArgument;
+	}
+
+	auto *put_comm = static_cast<nccl_ofi_rdma_gin_put_comm *>(collComm);
+	auto *ctx = static_cast<nccl_ofi_gin_gdaki_context *>(put_comm->get_gdaki_ctx());
+
+	if (ctx == nullptr) {
+		/* createContext not yet called — fall back to proxy-only. */
+		if (dmabuf_fd >= 0) {
+			return nccl_ofi_gin_regMrSymDmaBuf(collComm, data, size, type,
+							   dmabuf_offset, dmabuf_fd,
+							   mrFlags, mhandle, ginHandle);
+		}
+		return nccl_ofi_gin_regMrSym(collComm, data, size, type,
+					     mrFlags, mhandle, ginHandle);
+	}
+
+	/* Step 1: proxy-side registration (bootstrap). */
+	ncclResult_t pret;
+	if (dmabuf_fd >= 0) {
+		pret = nccl_ofi_gin_regMrSymDmaBuf(collComm, data, size, type,
+						   dmabuf_offset, dmabuf_fd,
+						   mrFlags, mhandle, ginHandle);
+	} else {
+		pret = nccl_ofi_gin_regMrSym(collComm, data, size, type,
+					     mrFlags, mhandle, ginHandle);
+	}
+	if (pret != ncclSuccess) {
+		return pret;
+	}
+	/* We are about to overwrite *ginHandle with our own wrapper. The
+	 * proxy's ginHandle pointer is stashed in *mhandle (same object),
+	 * so the proxy deregMrSym path still works via mhandle. */
+
+	int nranks = ctx->nranks;
+	int rank = ctx->rank;
+	auto *gda_ops = static_cast<struct fi_efa_ops_gda *>(ctx->gda_ops);
+
+	try {
+		/* Step 2: register on our efa-direct domain. For CUDA memory,
+		 * prefer dmabuf to avoid GDRCopy path; fall back to FI_HMEM. */
+		struct fid_mr *mr = nullptr;
+		struct iovec iov = {data, size};
+		struct fi_mr_attr attr = {};
+		attr.mr_iov = &iov;
+		attr.iov_count = 1;
+		attr.access = FI_SEND | FI_RECV | FI_READ | FI_WRITE |
+			      FI_REMOTE_READ | FI_REMOTE_WRITE;
+		if (type == NCCL_PTR_CUDA) {
+			attr.iface = FI_HMEM_CUDA;
+		}
+
+		uint64_t flags = 0;
+		struct fi_mr_dmabuf dmabuf = {};
+		int probed_dmabuf_fd = dmabuf_fd;
+		size_t probed_dmabuf_offset = dmabuf_offset;
+		if (type == NCCL_PTR_CUDA && probed_dmabuf_fd < 0) {
+			int rc = nccl_net_ofi_gpu_get_dma_buf_fd(
+				data, size, &probed_dmabuf_fd, &probed_dmabuf_offset);
+			if (rc != 0) {
+				probed_dmabuf_fd = -1;
+			}
+		}
+		if (probed_dmabuf_fd >= 0) {
+			dmabuf.fd = probed_dmabuf_fd;
+			dmabuf.offset = probed_dmabuf_offset;
+			dmabuf.len = size;
+			dmabuf.base_addr = data;
+			attr.dmabuf = &dmabuf;
+			flags = FI_MR_DMABUF;
+		}
+
+		int ret = fi_mr_regattr(ctx->ofi_domain, &attr, flags, &mr);
+		if (ret != 0) {
+			throw std::runtime_error(std::string("fi_mr_regattr GDAKI window: ") +
+						 fi_strerror(-ret));
+		}
+
+		uint32_t lkey_val = (uint32_t)gda_ops->get_mr_lkey(mr);
+		uint64_t rkey_val = fi_mr_key(mr);
+		uint64_t va_val = (uint64_t)data;
+
+		/* Step 3: allgather per-peer rkeys AND per-peer base VAs. */
+		std::vector<uint64_t> all_rkeys(nranks, 0);
+		std::vector<uint64_t> all_vas(nranks, 0);
+		all_rkeys[rank] = rkey_val;
+		all_vas[rank] = va_val;
+		ret = put_comm->get_ag_comm().all_gather(all_rkeys.data(),
+							 sizeof(uint64_t));
+		if (ret != 0) {
+			fi_close(&mr->fid);
+			throw std::runtime_error("allgather of window rkeys failed");
+		}
+		ret = put_comm->get_ag_comm().all_gather(all_vas.data(),
+							 sizeof(uint64_t));
+		if (ret != 0) {
+			fi_close(&mr->fid);
+			throw std::runtime_error("allgather of window VAs failed");
+		}
+
+		/* Step 4: allocate mr_handle with exact layout override expects:
+		 *   struct { __be32 *rkeys_ptr; __be32 lkey; int32_t nranks; }
+		 *   then __be32 rkeys[nranks]
+		 *   then uint64_t peer_bases[nranks]
+		 * All in one allocation so free() works.
+		 *
+		 * rkeys[] must be 4-byte aligned (it is, from sizeof struct).
+		 * peer_bases[] must be 8-byte aligned — rkeys_tail is at
+		 * sizeof(hdr) + nranks*4. We pad to 8-byte boundary if nranks is
+		 * odd, so peer_bases starts on 8-byte alignment. */
+		size_t hdr_size = sizeof(struct nccl_ofi_gin_gdaki_mr_handle);
+		size_t rkeys_bytes = (size_t)nranks * sizeof(__be32);
+		size_t pad = (rkeys_bytes % 8 == 0) ? 0 : 4;
+		size_t vas_bytes = (size_t)nranks * sizeof(uint64_t);
+		size_t handle_size = hdr_size + rkeys_bytes + pad + vas_bytes;
+
+		auto *gdaki_handle = static_cast<struct nccl_ofi_gin_gdaki_mr_handle *>(
+			calloc(1, handle_size));
+		if (!gdaki_handle) {
+			fi_close(&mr->fid);
+			throw std::runtime_error("calloc mr_handle failed");
+		}
+
+		__be32 *rkeys_tail = reinterpret_cast<__be32 *>(
+			reinterpret_cast<uintptr_t>(gdaki_handle) + hdr_size);
+		uint64_t *vas_tail = reinterpret_cast<uint64_t *>(
+			reinterpret_cast<uintptr_t>(gdaki_handle) +
+			hdr_size + rkeys_bytes + pad);
+
+		gdaki_handle->rkeys = rkeys_tail;   /* points INSIDE same alloc */
+		gdaki_handle->lkey = (__be32)lkey_val;
+		gdaki_handle->nranks = nranks;
+		for (int i = 0; i < nranks; i++) {
+			rkeys_tail[i] = (__be32)all_rkeys[i];
+			vas_tail[i] = all_vas[i];
+		}
+
+		/* Step 5: wrap + publish. The wrapper shape
+		 *   { void *mr_opaque; mr_handle *handle; }
+		 * matches ncclGinGdakiMrRegDevice in the override. */
+		auto *reg = new (std::nothrow) struct nccl_ofi_gin_gdaki_mr_reg();
+		if (!reg) {
+			free(gdaki_handle);
+			fi_close(&mr->fid);
+			throw std::runtime_error("new mr_reg failed");
+		}
+		reg->mr = mr;
+		reg->handle = gdaki_handle;
+
+		*ginHandle = reg;  /* OVERRIDE the proxy ginHandle */
+		return ncclSuccess;
+
+	} catch (const std::exception &e) {
+		NCCL_OFI_WARN("gin GDAKI: regMrSym failed: %s", e.what());
+		return ncclSystemError;
+	}
+}
+
+static ncclResult_t nccl_ofi_gin_gdaki_regMrSym(void *collComm, void *data, size_t size,
+						int type, uint64_t mrFlags,
+						void **mhandle, void **ginHandle)
+{
+	return gdaki_reg_mr_common(collComm, data, size, type, mrFlags,
+				   /*dmabuf_fd=*/-1, /*dmabuf_offset=*/0,
+				   mhandle, ginHandle);
+}
+
+static ncclResult_t nccl_ofi_gin_gdaki_regMrSymDmaBuf(void *collComm, void *data, size_t size,
+						      int type, uint64_t offset, int fd,
+						      uint64_t mrFlags, void **mhandle,
+						      void **ginHandle)
+{
+	return gdaki_reg_mr_common(collComm, data, size, type, mrFlags,
+				   fd, offset, mhandle, ginHandle);
+}
+
+static ncclResult_t nccl_ofi_gin_gdaki_deregMrSym(void *collComm, void *mhandle)
+{
+	/* Proxy deregistration on mhandle (which remains the proxy's symm handle).
+	 * The GDAKI-side wrapper *ginHandle was published separately and NCCL
+	 * has its own lifecycle for that pointer. */
+	return nccl_ofi_gin_deregMrSym(collComm, mhandle);
+}
+
+#else  /* !HAVE_EFA_DP_DIRECT || !HAVE_DECL_FI_EFA_GDA_OPS */
+
+static ncclResult_t nccl_ofi_gin_gdaki_regMrSym(void *collComm, void *data, size_t size,
+						int type, uint64_t mrFlags,
+						void **mhandle, void **ginHandle)
+{
+	return nccl_ofi_gin_regMrSym(collComm, data, size, type, mrFlags,
+				     mhandle, ginHandle);
+}
+
+static ncclResult_t nccl_ofi_gin_gdaki_regMrSymDmaBuf(void *collComm, void *data, size_t size,
+						      int type, uint64_t offset, int fd,
+						      uint64_t mrFlags, void **mhandle,
+						      void **ginHandle)
+{
+	return nccl_ofi_gin_regMrSymDmaBuf(collComm, data, size, type,
+					   offset, fd, mrFlags, mhandle, ginHandle);
+}
+
+static ncclResult_t nccl_ofi_gin_gdaki_deregMrSym(void *collComm, void *mhandle)
+{
+	return nccl_ofi_gin_deregMrSym(collComm, mhandle);
+}
+
+#endif /* HAVE_EFA_DP_DIRECT && HAVE_DECL_FI_EFA_GDA_OPS */
+
 static ncclResult_t nccl_ofi_gin_gdaki_queryLastError(void *ginCtx, bool *hasError)
 {
 	(void)ginCtx;
@@ -644,9 +884,9 @@ ncclGin_v13_t nccl_ofi_gin_gdaki_plugin = {
 	.listen = nullptr,
 	.connect = nullptr,
 	.createContext = nccl_ofi_gin_gdaki_createContext,
-	.regMrSym = nullptr,
-	.regMrSymDmaBuf = nullptr,
-	.deregMrSym = nullptr,
+	.regMrSym = nccl_ofi_gin_gdaki_regMrSym,
+	.regMrSymDmaBuf = nccl_ofi_gin_gdaki_regMrSymDmaBuf,
+	.deregMrSym = nccl_ofi_gin_gdaki_deregMrSym,
 	.destroyContext = nccl_ofi_gin_gdaki_destroyContext,
 	.closeColl = nullptr,
 	.closeListen = nullptr,

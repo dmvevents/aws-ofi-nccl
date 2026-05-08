@@ -93,9 +93,12 @@ static ncclResult_t nccl_ofi_gin_init(void **ctx, uint64_t commId, ncclDebugLogg
 		nccl_ofi_gin_gdaki_plugin.devices = ncclGinPlugin_v13.devices;
 		nccl_ofi_gin_gdaki_plugin.listen = ncclGinPlugin_v13.listen;
 		nccl_ofi_gin_gdaki_plugin.connect = ncclGinPlugin_v13.connect;
-		nccl_ofi_gin_gdaki_plugin.regMrSym = ncclGinPlugin_v13.regMrSym;
-		nccl_ofi_gin_gdaki_plugin.regMrSymDmaBuf = ncclGinPlugin_v13.regMrSymDmaBuf;
-		nccl_ofi_gin_gdaki_plugin.deregMrSym = ncclGinPlugin_v13.deregMrSym;
+		/* regMrSym / regMrSymDmaBuf / deregMrSym: GDAKI-native impls
+		 * (T6) now live in nccl_ofi_gin_gdaki_plugin directly. They
+		 * internally call the proxy-side versions for bootstrap + then
+		 * register on the efa-direct domain + allgather per-peer
+		 * rkeys + VAs + publish the GDAKI mr_handle wrapper through
+		 * ginHandle. No copy from proxy plugin needed. */
 		nccl_ofi_gin_gdaki_plugin.closeColl = ncclGinPlugin_v13.closeColl;
 		nccl_ofi_gin_gdaki_plugin.closeListen = ncclGinPlugin_v13.closeListen;
 		nccl_ofi_gin_gdaki_plugin.ginProgress = ncclGinPlugin_v13.ginProgress;

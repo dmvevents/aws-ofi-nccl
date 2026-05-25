@@ -129,6 +129,14 @@ int nccl_ofi_gdrcopy_ctx::register_region(void *device_ptr, size_t size, RegHand
 			ret = pimpl->gdr_pin_buffer_v2_fn(pimpl->gdr, regbgn,
 							  handle->gdr_reglen, flags, &mh);
 		}
+		/* FALLBACK_V1_FOR_GDRDRV_24: cluster has gdrdrv 2.4 + libgdrapi 2.5 — v2 ioctl
+		 * returns EINVAL because kernel doesn't know v2 cmd. Fall back to v1 which is
+		 * identical at the gdr_mh_t output level (only difference is the flags input).
+		 */
+		if (ret == 22 || ret == 25) {
+			ret = pimpl->gdr_pin_buffer_fn(pimpl->gdr, regbgn,
+						       handle->gdr_reglen, 0, 0, &mh);
+		}
 	} else {
 		ret = pimpl->gdr_pin_buffer_fn(pimpl->gdr, regbgn, handle->gdr_reglen, 0, 0, &mh);
 	}
